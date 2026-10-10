@@ -954,8 +954,9 @@ tier = "{input}"
     }
 
     /// The exemption rides on [`overlays_local_thinking`], so a slug added to
-    /// `LOCAL_OVERLAY_SLUGS` without a `resolve_protocol` call in its
-    /// constructor would silently claim a `protocol` nobody reads.
+    /// `LOCAL_OVERLAY_SLUGS` whose constructor never calls `resolve_protocol`
+    /// would silently claim a `protocol` nobody reads. The per-slug expectations
+    /// above cover what the warning says; this covers whether that is true.
     #[test]
     fn every_exempt_slug_really_resolves_its_configured_protocol() {
         let def = ProviderDef {
