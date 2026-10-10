@@ -186,6 +186,14 @@ This provider talks the OpenAI-compatible `/v1` API, so it also works with llama
 
 Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your server address (defaults to `http://localhost:8080`).
 
+### LocalAI
+
+- **Env var**: `LOCALAI_HOST` for local/remote (e.g. `http://localhost:8080`); most instances need no key, but set `LOCALAI_API_KEY` for one behind a proxy
+- **API**: `http://localhost:8080/v1`
+- **Features**: Local or remote inference via LOCALAI_HOST, set optional key via LOCALAI_API_KEY
+
+LocalAI exposes its full model table over the OpenAI-compatible `/v1` API; its `/v1/models/capabilities` endpoint additionally publishes `context_size` plus capabilities/modalities. Older instances fall back to the Ollama-compat `/api/tags` + `/api/show`. This provider also works with llama.cpp's server, which speaks the same protocol.
+
 ### Z.AI
 
 - **Env var**: `ZHIPU_API_KEY` (shared across both endpoints)
@@ -555,7 +563,7 @@ Set exactly one of the two. `codec` picks the wire format the API speaks:
 | `anthropic` | Anthropic messages |
 | `google` | Gemini `generateContent` |
 
-`base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `zai`, `opencode`, `xai`, `aperture`.
+`base` borrows a built-in provider's whole adapter, quirks included, such as Ollama's thinking field or Copilot's endpoint routing. Use it when porting a provider script that set `base`, or when no codec fits. A base changes whenever that provider does, so prefer a codec. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `localai`, `zai`, `opencode`, `xai`, `aperture`.
 
 Without a `list_models` hook, the provider lists what its codec or base lists, such as `GET /models` for `codec = "openai"`. A `base` also lends its model rows, so a model your `models` table leaves out keeps the base's price, limits and tier.
 

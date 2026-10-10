@@ -19,7 +19,7 @@ const PROVIDERS_FILE: &str = "providers.toml";
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
-const LOCAL_OVERLAY_SLUGS: [&str; 2] = ["ollama", "llama-cpp"];
+const LOCAL_OVERLAY_SLUGS: [&str; 3] = ["ollama", "llama-cpp", "localai"];
 
 /// Where the last parse came from and what the file looked like then. The
 /// config path follows the project directory, so one process can read more
