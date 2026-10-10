@@ -1,7 +1,3 @@
-//! LocalAI provider: OpenAI-compatible local inference with LocalAI's
-//! `/v1/models/capabilities` discovery surface (and Ollama-compat `/api`
-//! endpoints as a fallback).
-
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -26,17 +22,14 @@ const LOCALAI_SLUG: &str = "localai";
 const LOCALAI_BASE_URL: &str = "http://localhost:8080/v1";
 const LOCALAI_KEY_ENV: &str = "LOCALAI_API_KEY";
 
-/// LocalAI is configured via `LOCALAI_HOST`. The key stays optional: most
-/// instances need none, but a proxy in front of one may demand one, and
-/// `KeyPool::resolve` failing is how that stays optional.
+/// `KeyPool::resolve` failing is not fatal, so the key stays
+/// optional: most instances need none, but a proxy may demand one.
 const AUTH_DOC: &str = "`LOCALAI_HOST` for local/remote (e.g. `http://localhost:8080`); \
      most instances need no key, but set `LOCALAI_API_KEY` for one behind a proxy";
 
 const FEATURES: &str =
     "Local or remote inference via LOCALAI_HOST, set optional key via LOCALAI_API_KEY";
 
-/// Discovery note: LocalAI's capability endpoint is the authoritative source
-/// for context length, and the Ollama-compat `/api` endpoints are a fallback.
 const DISCOVERY_NOTE: &str = "LocalAI exposes its full model table over the OpenAI-compatible `/v1` API; its \
     `/v1/models/capabilities` endpoint additionally publishes `context_size` plus \
     capabilities/modalities. Older instances fall back to the Ollama-compat \

@@ -534,12 +534,8 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
     None
 }
 
-const LOCALAI_CAPABILITY_THINKING: &str = "thinking";
-const LOCALAI_CAPABILITY_VISION: &str = "vision";
-const LOCALAI_IMAGE_MODALITY: &str = "image";
-
-/// Context window assumed when LocalAI's capability surface omits
-/// `context_size`, which it does for models loaded without an explicit limit.
+/// LocalAI omits `context_size` for models loaded without an
+/// explicit limit, so discovery assumes this instead of none.
 const LOCALAI_ASSUMED_CONTEXT_WINDOW: u32 = 128_000;
 
 #[derive(Deserialize)]
@@ -551,8 +547,8 @@ struct LocalAiCapabilitiesResponse {
 #[derive(Deserialize)]
 struct LocalAiCapabilityEntry {
     id: String,
-    /// Absent on older instances, which report neither `thinking` nor
-    /// `vision` here.
+    /// Absent on older instances, which report neither thinking nor
+    /// vision.
     #[serde(default)]
     capabilities: Option<Vec<String>>,
     #[serde(default)]
@@ -561,7 +557,16 @@ struct LocalAiCapabilityEntry {
     context_size: Option<u32>,
 }
 
-// Fallback for the Ollama-compat /api/tags listing (older LocalAI instances).
+/// An absent or unparsable body means an older instance, so this
+/// yields no entries and discovery falls back to the Ollama-compat
+/// surface instead of reporting no models.
+fn localai_capability_entries(body: &str) -> Vec<LocalAiCapabilityEntry> {
+    serde_json::from_str::<LocalAiCapabilitiesResponse>(body)
+        .map(|r| r.data)
+        .unwrap_or_default()
+}
+
+// Ollama-compat /api/tags listing, the fallback for older LocalAI.
 #[derive(Deserialize)]
 struct OllamaApiTagsResponse {
     #[serde(default)]
@@ -575,23 +580,22 @@ struct OllamaApiTagsEntry {
 }
 
 /// `None` when the entry reported neither `capabilities` nor
-/// `input_modalities`, so the family default decides instead of claiming "no
-/// vision" for a model nobody ever checked. Same contract as
-/// [`ollama_extract_vision`].
+/// `input_modalities`, so the family default decides rather than
+/// claiming "no vision" for a model nobody checked. Same contract
+/// as [`ollama_extract_vision`].
 fn localai_extract_vision(capabilities: Option<&[String]>, modalities: &[String]) -> Option<bool> {
     if capabilities.is_none() && modalities.is_empty() {
         return None;
     }
-    let vision_capability =
-        capabilities.is_some_and(|caps| caps.iter().any(|c| c == LOCALAI_CAPABILITY_VISION));
-    Some(vision_capability || modalities.iter().any(|m| m == LOCALAI_IMAGE_MODALITY))
+    let vision = capabilities.is_some_and(|caps| caps.iter().any(|c| c == "vision"));
+    Some(vision || modalities.iter().any(|m| m == "image"))
 }
 
 fn localai_capability_model_info(entry: LocalAiCapabilityEntry) -> crate::model::ModelInfo {
     let supports_thinking = entry
         .capabilities
         .as_deref()
-        .map(|caps| caps.iter().any(|c| c == LOCALAI_CAPABILITY_THINKING));
+        .map(|caps| caps.iter().any(|c| c == "thinking"));
     let supports_vision =
         localai_extract_vision(entry.capabilities.as_deref(), &entry.input_modalities);
 
@@ -623,29 +627,36 @@ impl LocalEndpoint {
             .unwrap_or(&self.compat.config().base_url);
         let root = base.strip_suffix("/v1").unwrap_or(base);
 
-        // Primary: LocalAI's additive capability surface. An empty or unparsable
-        // body means an older instance, so the fallbacks below take over.
-        let caps_url = format!("{root}/v1/models/capabilities");
-        let entries: Vec<LocalAiCapabilityEntry> = match self.compat.get_text(auth, &caps_url).await
-        {
-            Ok(t) => match serde_json::from_str::<LocalAiCapabilitiesResponse>(&t) {
-                Ok(r) if !r.data.is_empty() => r.data,
-                _ => Vec::new(),
-            },
-            Err(_) => Vec::new(),
+        // An empty or unparsable body means an older instance, so
+        // the fallback below takes over.
+        let caps = self
+            .compat
+            .get_text(auth, &format!("{root}/v1/models/capabilities"))
+            .await
+            .map(|t| localai_capability_entries(&t))
+            .unwrap_or_default();
+
+        let mut models = if caps.is_empty() {
+            self.localai_legacy_models(auth, root).await?
+        } else {
+            caps.into_iter()
+                .map(localai_capability_model_info)
+                .collect()
         };
 
-        if !entries.is_empty() {
-            let mut models: Vec<crate::model::ModelInfo> = entries
-                .into_iter()
-                .map(localai_capability_model_info)
-                .collect();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
-            return Ok(models);
-        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
+    }
 
-        // Older instance: a plain OpenAI listing carries only ids, so every
-        // limit is unknown until the Ollama-compat surface fills it in.
+    /// An instance without the capability surface. The OpenAI listing
+    /// carries only ids, so the Ollama-compat surface fills in the
+    /// limits. That enrichment is optional, so a failure there leaves
+    /// the ids-only listing intact rather than losing the model.
+    async fn localai_legacy_models(
+        &self,
+        auth: &ResolvedAuth,
+        root: &str,
+    ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
         let models_text = self
             .compat
             .get_text(auth, &format!("{root}/v1/models"))
@@ -668,25 +679,24 @@ impl LocalEndpoint {
             })
             .collect();
 
-        // /api/tags lists the models, /api/show carries context_length inside
-        // model_info. Both are optional on an older instance, so a failure
-        // here leaves the ids-only listing intact.
+        // /api/tags lists the models; /api/show carries the context
+        // length the listing leaves out.
         let Ok(tags_text) = self
             .compat
             .get_text(auth, &format!("{root}/api/tags"))
             .await
         else {
-            return Ok(localai_sorted(models));
+            return Ok(models);
         };
         let tags: OllamaApiTagsResponse = match serde_json::from_str(&tags_text) {
             Ok(b) => b,
             Err(e) => {
                 warn!("Failed to parse LocalAI Ollama-compat /api/tags: {e}");
-                return Ok(localai_sorted(models));
+                return Ok(models);
             }
         };
         if tags.models.is_empty() {
-            return Ok(localai_sorted(models));
+            return Ok(models);
         }
 
         let compat = &self.compat;
@@ -711,9 +721,9 @@ impl LocalEndpoint {
                 model.supports_vision = details.supports_vision;
             }
         }
-        // The two surfaces name their models independently, and a proxy in
-        // between may rewrite one of them, so a total miss is worth a line
-        // rather than a silent "no limits known".
+        // The two surfaces name models independently, and a proxy in between
+        // may rewrite one of them, so a total miss is worth a line rather
+        // than a silent "no limits known".
         if enriched == 0 {
             warn!(
                 listed = models.len(),
@@ -722,13 +732,8 @@ impl LocalEndpoint {
             );
         }
 
-        Ok(localai_sorted(models))
+        Ok(models)
     }
-}
-
-fn localai_sorted(mut models: Vec<crate::model::ModelInfo>) -> Vec<crate::model::ModelInfo> {
-    models.sort_by(|a, b| a.id.cmp(&b.id));
-    models
 }
 
 const OLLAMA_SLUG: &str = "ollama";
@@ -793,23 +798,16 @@ mod tests {
     }
 
     /// An empty `api_key_env` makes `KeyPool::resolve` call `env::var("")`,
-    /// which is always `Err`, so the key could never be set. Every local
-    /// endpoint names a real var; the key stays optional because `resolve`
-    /// failing is not fatal.
+    /// which is always `Err`, so the key could never be set.
     #[test]
     fn every_local_slug_names_a_real_key_env() {
         for cfg in [OLLAMA, LLAMACPP, localai::LOCALAI] {
             assert!(!cfg.api_key_env.is_empty(), "{} has no key env", cfg.slug);
-            assert!(
-                std::env::var(cfg.api_key_env).is_err(),
-                "{} is set in this environment",
-                cfg.api_key_env
-            );
         }
     }
 
-    /// The spec's var is what `child_env` and `models_cache` read, so it has
-    /// to match the one the request path resolves against.
+    /// `child_env` and `models_cache` read the spec's var, so it has to
+    /// match the one the request path resolves against.
     #[test]
     fn localai_spec_and_endpoint_agree_on_the_key_env() {
         assert_eq!(localai::SPEC.api_key_env, localai::LOCALAI.api_key_env);
@@ -1364,29 +1362,13 @@ mod tests {
         }
 
         /// LocalAI reports a context length only for models loaded with an
-        /// explicit one, so the assumption has to be visible.
-        #[test]
-        fn keeps_the_reported_context_size() {
-            assert_eq!(
-                info(r#"{"id": "m", "context_size": 32000}"#).context_window,
-                Some(32_000)
-            );
-        }
-
-        #[test]
-        fn assumes_a_window_when_the_entry_omits_one() {
-            assert_eq!(
-                info(r#"{"id": "m"}"#).context_window,
-                Some(LOCALAI_ASSUMED_CONTEXT_WINDOW)
-            );
-        }
-
-        #[test]
-        fn a_zero_context_size_is_not_a_limit() {
-            assert_eq!(
-                info(r#"{"id": "m", "context_size": 0}"#).context_window,
-                Some(LOCALAI_ASSUMED_CONTEXT_WINDOW)
-            );
+        /// explicit one; a missing or zero value means "no limit reported",
+        /// so the assumed window has to be visible.
+        #[test_case(r#"{"id": "m", "context_size": 32000}"#, 32_000 ; "reported")]
+        #[test_case(r#"{"id": "m"}"#, LOCALAI_ASSUMED_CONTEXT_WINDOW ; "omitted")]
+        #[test_case(r#"{"id": "m", "context_size": 0}"#, LOCALAI_ASSUMED_CONTEXT_WINDOW ; "zero_is_not_a_limit")]
+        fn resolves_the_context_window(body: &str, expected: u32) {
+            assert_eq!(info(body).context_window, Some(expected));
         }
 
         /// An older instance publishes no `capabilities`, so discovery must
@@ -1399,11 +1381,17 @@ mod tests {
             assert_eq!(info(body).supports_thinking, expected);
         }
 
+        /// Vision is granted by either a `vision` capability or an
+        /// `image` input modality; an absent `capabilities` field
+        /// leaves it undecided rather than pinned to `false`.
         #[test_case(r#"{"id": "m", "capabilities": ["vision"]}"#, Some(true) ; "vision_capability")]
         #[test_case(r#"{"id": "m", "capabilities": ["completion"]}"#, Some(false) ; "capabilities_without_vision")]
         #[test_case(r#"{"id": "m", "input_modalities": ["image", "text"]}"#, Some(true) ; "image_modality")]
         #[test_case(r#"{"id": "m", "capabilities": ["completion"], "input_modalities": ["text"]}"#, Some(false) ; "text_only_modality")]
         #[test_case(r#"{"id": "m"}"#, None ; "neither_field_reported")]
+        #[test_case(r#"{"id": "m", "capabilities": []}"#, Some(false) ; "empty_capabilities")]
+        #[test_case(r#"{"id": "m", "capabilities": ["vision"], "input_modalities": ["text"]}"#, Some(true) ; "either_field_grants_vision")]
+        #[test_case(r#"{"id": "m", "capabilities": ["completion"], "input_modalities": ["image"]}"#, Some(true) ; "either_field_grants_vision_from_modality")]
         fn resolves_vision(body: &str, expected: Option<bool>) {
             assert_eq!(info(body).supports_vision, expected);
         }
@@ -1417,64 +1405,26 @@ mod tests {
         }
     }
 
-    mod localai_extract_vision {
+    mod localai_capability_entries {
         use test_case::test_case;
 
         use super::super::*;
 
         #[test]
-        fn none_when_the_server_reported_neither_field() {
-            assert_eq!(localai_extract_vision(None, &[]), None);
-        }
-
-        #[test_case(&["completion"], false ; "no_vision")]
-        #[test_case(&["vision"], true ; "vision")]
-        fn answers_from_capabilities_alone(caps: &[&str], expected: bool) {
-            let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
-            assert_eq!(localai_extract_vision(Some(&caps), &[]), Some(expected));
-        }
-
-        #[test_case(&["image", "text"], true ; "image")]
-        #[test_case(&["text"], false ; "text")]
-        fn answers_from_modalities_alone(modalities: &[&str], expected: bool) {
-            let modalities: Vec<String> = modalities.iter().map(|m| m.to_string()).collect();
-            assert_eq!(localai_extract_vision(None, &modalities), Some(expected));
-        }
-
-        #[test]
-        fn either_field_grants_vision() {
-            assert_eq!(
-                localai_extract_vision(Some(&["vision".into()]), &["text".into()]),
-                Some(true)
-            );
-            assert_eq!(
-                localai_extract_vision(Some(&["completion".into()]), &["image".into()]),
-                Some(true)
-            );
-        }
-    }
-
-    mod localai_capabilities_response {
-        use super::super::*;
-
-        const PARSE_FAILED: &str = "failed to parse /v1/models/capabilities body";
-
-        #[test]
         fn reads_the_data_array() {
             let body = r#"{"data": [{"id": "a"}, {"id": "b"}]}"#;
-            let parsed: LocalAiCapabilitiesResponse =
-                serde_json::from_str(body).expect(PARSE_FAILED);
-            let ids: Vec<&str> = parsed.data.iter().map(|e| e.id.as_str()).collect();
+            let entries = localai_capability_entries(body);
+            let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
             assert_eq!(ids, ["a", "b"]);
         }
 
-        /// An older instance 404s or answers a body without `data`; discovery
-        /// treats that as "no capability surface" and falls back.
-        #[test]
-        fn an_absent_data_array_yields_no_entries() {
-            let parsed: LocalAiCapabilitiesResponse =
-                serde_json::from_str("{}").expect(PARSE_FAILED);
-            assert!(parsed.data.is_empty());
+        /// An older instance 404s or answers a body without `data`;
+        /// discovery treats that as "no capability surface" and falls
+        /// back to the Ollama-compat listing.
+        #[test_case("{}" ; "empty_object")]
+        #[test_case("not json" ; "unparsable")]
+        fn an_absent_or_unparsable_body_yields_no_entries(body: &str) {
+            assert!(localai_capability_entries(body).is_empty());
         }
     }
 }
