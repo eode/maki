@@ -111,7 +111,12 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",
-        session::create_session_table(lua, ui_action_tx.clone())?,
+        session::create_session_table(
+            lua,
+            ui_action_tx.clone(),
+            permissions,
+            permissions.is_allowed(Permission::Agent),
+        )?,
     )?;
     maki.set(
         "model",
@@ -142,7 +147,10 @@ pub(crate) fn create_maki_global(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    maki.set("agent", agent::create_agent_table(lua)?)?;
+    maki.set(
+        "agent",
+        agent::create_agent_table(lua, Arc::clone(&plugin), permissions.clone())?,
+    )?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

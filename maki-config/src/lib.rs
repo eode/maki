@@ -8,7 +8,8 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, IgnoredAny};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use strum::VariantArray;
 use thiserror::Error;
@@ -31,6 +32,10 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_THINKING_LINES: usize = 3;
+const NEVER_COLLAPSE_THINKING: i64 = -1;
+const THINKING_LINES_RANGE: &str =
+    "thinking_lines must be -1 (never collapse), 0 (header only) or a row count";
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
@@ -136,9 +141,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 /// costs at scale is not yet known.
 pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
 
-/// These used to be their own `tools.<name>` tables and are now edit plugin
-/// options; the config layer uses this list to reject the old form with a
-/// pointer to the new one.
+/// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
@@ -160,6 +163,7 @@ pub enum Permission {
     Net,
     Run,
     Env,
+    Agent,
 }
 
 impl Permission {
@@ -192,6 +196,7 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+            Permission::Agent => "agent",
         }
     }
 
@@ -205,6 +210,9 @@ impl Permission {
             Permission::Net => "outbound network requests",
             Permission::Run => "starting processes",
             Permission::Env => "reading the process environment, where secrets live",
+            Permission::Agent => {
+                "starting model turns: prompting a chat, or running its own sessions"
+            }
         }
     }
 }
@@ -411,24 +419,15 @@ pub enum ConfigError {
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
     #[error(
-        "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
-         set plugins.edit = {{ {tool} = true|false }} instead"
-    )]
-    RemovedEditSubTool { tool: &'static str },
-    #[error(
         "invalid config: plugins.{plugin}: no bundled plugin or installed \
          package is named \"{plugin}\" (available: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
     #[error(
-        "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
-         (plugins can provide more than tools).\n\n\
-         Fix your config with:\n\n    \
-         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/maki/init.lua\n\n\
-         Run it on .maki/init.lua too if you keep a project config. \
-         A .bak backup is left next to the file."
+        "invalid config: ui.show_thinking was replaced by ui.thinking_lines. \
+         Use thinking_lines = -1 for show_thinking = true, or 0 for show_thinking = false"
     )]
-    RenamedToolsTable,
+    RenamedShowThinking,
     #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
     InvalidModelPattern {
         field: &'static str,
@@ -532,9 +531,6 @@ pub struct RawConfig {
     pub trust: TrustFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
-    /// Renamed to `plugins`; kept so old configs fail with a pointer to the
-    /// new name instead of a generic unknown-field error.
-    tools: HashMap<String, PluginFileConfig>,
 }
 
 impl RawConfig {
@@ -561,7 +557,6 @@ impl RawConfig {
             }
             entry.opts.extend(plugin.opts);
         }
-        self.tools.extend(overlay.tools);
     }
 
     /// `packages` are the external package names discovery found. They are
@@ -569,6 +564,9 @@ impl RawConfig {
     /// state: it is not written in any config file and must not survive a
     /// merge between two of them.
     pub fn into_config(self, packages: &[String]) -> Result<Config, ConfigError> {
+        if self.ui.show_thinking.is_some() {
+            return Err(ConfigError::RenamedShowThinking);
+        }
         self.validate_plugin_tables(packages)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
@@ -595,14 +593,6 @@ impl RawConfig {
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
     fn validate_plugin_tables(&self, packages: &[String]) -> Result<(), ConfigError> {
-        if !self.tools.is_empty() {
-            return Err(ConfigError::RenamedToolsTable);
-        }
-        for &name in EDIT_SUB_TOOLS {
-            if self.plugins.contains_key(name) {
-                return Err(ConfigError::RemovedEditSubTool { tool: name });
-            }
-        }
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
@@ -647,7 +637,10 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
-    pub show_thinking: Option<bool>,
+    pub thinking_lines: Option<ThinkingLines>,
+    /// Gone, replaced by `thinking_lines`. We still read it so an old config
+    /// gets told about the new key, not a vague unknown-field error.
+    show_thinking: Option<IgnoredAny>,
     pub theme: Option<String>,
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
@@ -666,6 +659,7 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
+            thinking_lines,
             show_thinking,
             theme,
             clock_format,
@@ -679,6 +673,25 @@ impl UiFileConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingLines {
+    Never,
+    /// Rows as wrapped on screen, not source lines, so a long paragraph
+    /// cannot sneak past the limit.
+    Tail(usize),
+}
+
+impl<'de> Deserialize<'de> for ThinkingLines {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match i64::deserialize(deserializer)? {
+            NEVER_COLLAPSE_THINKING => Ok(Self::Never),
+            rows => usize::try_from(rows)
+                .map(Self::Tail)
+                .map_err(|_| D::Error::custom(THINKING_LINES_RANGE)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NotificationMethod {
@@ -686,6 +699,7 @@ pub enum NotificationMethod {
     Auto,
     Osc9,
     Bell,
+    Notify,
     Off,
 }
 
@@ -801,6 +815,7 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
     pub rtk: Option<bool>,
+    pub shell: Option<ShellPreference>,
 }
 
 impl AgentFileConfig {
@@ -816,7 +831,8 @@ impl AgentFileConfig {
             compaction_instructions,
             post_compaction_instructions,
             stale_read_check,
-            rtk
+            rtk,
+            shell
         );
     }
 }
@@ -1240,7 +1256,7 @@ pub struct UiConfig {
         default = NotificationMethod::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Terminal notification method: auto, osc9, bell, or off"
+        desc = "Notification method: auto, osc9, bell, notify, or off"
     )]
     pub notifications: NotificationMethod,
 
@@ -1257,10 +1273,12 @@ pub struct UiConfig {
     pub max_input_lines: u32,
 
     #[config(
-        default = true,
-        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+        default = ThinkingLines::Tail(DEFAULT_THINKING_LINES),
+        ty = "integer",
+        default_doc = "3",
+        desc = "Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses"
     )]
-    pub show_thinking: bool,
+    pub thinking_lines: ThinkingLines,
 
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
@@ -1289,7 +1307,9 @@ impl UiConfig {
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
-            show_thinking: f.show_thinking.unwrap_or(true),
+            thinking_lines: f
+                .thinking_lines
+                .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
@@ -1406,13 +1426,24 @@ impl Default for ToolOutputLines {
     }
 }
 
+/// Only Windows reads this, Unix always runs `bash -c`. There is no `Cmd`
+/// variant because `cmd` is just a program too, one that wants `/C`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellPreference {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(untagged)]
+    Program(PathBuf),
+}
+
 #[derive(Debug, Clone, ConfigSection, Serialize)]
 #[config(section = "agent")]
 pub struct AgentConfig {
-    #[config(default = DEFAULT_MAX_OUTPUT_BYTES, min = MIN_OUTPUT_BYTES, desc = "Max tool output size (bytes)")]
+    #[config(default = DEFAULT_MAX_OUTPUT_BYTES, min = MIN_OUTPUT_BYTES, desc = "Max bytes of tool output the model sees")]
     pub max_output_bytes: usize,
 
-    #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Max tool output lines")]
+    #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Max lines of tool output the model sees")]
     pub max_output_lines: usize,
 
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
@@ -1446,9 +1477,17 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
+        desc = "Rewrite the model's bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
     )]
     pub rtk: bool,
+
+    #[config(
+        default = ShellPreference::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Shell for string commands on Windows (`jobstart`, UI `!`): `auto` (Git Bash if installed, else `cmd.exe`), `cmd`, or a path to an executable"
+    )]
+    pub shell: ShellPreference,
 
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
@@ -1476,6 +1515,7 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             rtk: file.rtk.unwrap_or(true),
+            shell: file.shell.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -2211,16 +2251,6 @@ fn parse_mcp_server_table(
                             }
                         }
                     }
-                    toml::Value::Boolean(true) => {
-                        tracing::warn!(
-                            server = server_name,
-                            key = key.as_str(),
-                            "{key} = true is deprecated — use default = \"{key}\" instead; ignoring"
-                        );
-                    }
-                    toml::Value::Boolean(false) => {
-                        // No-op: explicitly disabled.
-                    }
                     toml::Value::String(s) => {
                         let tool_name = s.as_str();
                         if tool_name == "*" {
@@ -2842,6 +2872,13 @@ mod tests {
         assert!(serde_json::from_str::<CompactionBuffer>(json).is_err());
     }
 
+    #[test_case("\"auto\"", ShellPreference::Auto ; "auto")]
+    #[test_case(r#""C:\\Git\\bin\\bash.exe""#, ShellPreference::Program(PathBuf::from(r"C:\Git\bin\bash.exe")) ; "path")]
+    fn shell_preference_deserializes(json: &str, expected: ShellPreference) {
+        let parsed: ShellPreference = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
     #[test_case(CompactionBuffer::Tokens(10_000), 64_000, 10_000 ; "tokens_ignore_window")]
     #[test_case(CompactionBuffer::Percent(20), 64_000, 12_800 ; "percent_of_window")]
     fn compaction_buffer_resolves(buffer: CompactionBuffer, window: u32, expected: u32) {
@@ -2879,6 +2916,7 @@ mod tests {
     #[test_case("auto", NotificationMethod::Auto ; "auto")]
     #[test_case("osc9", NotificationMethod::Osc9 ; "osc9")]
     #[test_case("bell", NotificationMethod::Bell ; "bell")]
+    #[test_case("notify", NotificationMethod::Notify ; "notify")]
     #[test_case("off", NotificationMethod::Off ; "off")]
     fn notifications_deserialize(value: &str, expected: NotificationMethod) {
         let raw: RawConfig =
@@ -3977,23 +4015,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn show_thinking_deserializes_true() {
-        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
-        assert!(raw.ui.show_thinking.unwrap());
+    #[test_case(-1 => ThinkingLines::Never ; "minus_one_never_collapses")]
+    #[test_case(0 => ThinkingLines::Tail(0) ; "zero_is_header_only")]
+    #[test_case(5 => ThinkingLines::Tail(5) ; "positive_is_a_row_count")]
+    fn thinking_lines_deserializes(value: i64) -> ThinkingLines {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nthinking_lines = {value}\n")).unwrap();
+        raw.into_config(&[]).unwrap().ui.thinking_lines
     }
 
     #[test]
-    fn show_thinking_deserializes_false() {
+    fn thinking_lines_rejects_below_minus_one() {
+        let err = toml::from_str::<RawConfig>("[ui]\nthinking_lines = -2\n").unwrap_err();
+        assert!(err.to_string().contains(THINKING_LINES_RANGE), "got: {err}");
+    }
+
+    #[test]
+    fn show_thinking_points_to_thinking_lines() {
         let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
-        assert!(!raw.ui.show_thinking.unwrap());
-    }
-
-    #[test]
-    fn show_thinking_missing_defaults_true() {
-        let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config(&[]).unwrap();
-        assert!(config.ui.show_thinking);
+        assert!(matches!(
+            raw.into_config(&[]),
+            Err(ConfigError::RenamedShowThinking)
+        ));
     }
 
     #[test]
@@ -4178,22 +4220,6 @@ mod tests {
         assert!(on.plugins.names.iter().any(|n| n == name));
     }
 
-    #[test]
-    fn removed_sub_tool_tables_error() {
-        for &tool in EDIT_SUB_TOOLS {
-            let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
-            let Err(err) = raw.into_config(&[]) else {
-                panic!("plugins.{tool} should be rejected");
-            };
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&format!("plugins.{tool} was removed"))
-                    && msg.contains("plugins.edit = {"),
-                "error should point at plugins.edit, got: {msg}"
-            );
-        }
-    }
-
     #[test_case("enabled = false" ; "enabled_false")]
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
@@ -4280,18 +4306,6 @@ mod tests {
     }
 
     #[test]
-    fn renamed_tools_table_errors() {
-        let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config(&[]) else {
-            panic!("old tools table should be rejected");
-        };
-        assert!(
-            err.to_string().contains("renamed to `plugins`"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn edit_sub_tool_toggles_flow_as_edit_opts() {
         let raw: RawConfig =
             toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
@@ -4332,62 +4346,6 @@ mod tests {
                 tool: "fetch".into()
             }
             && r.effect == Effect::Allow));
-    }
-
-    #[test]
-    fn permissions_mcp_server_wide_allow_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(perms.rules.len(), 0, "no rules generated");
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "deepwiki".into()
-            }),
-            "allow = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn permissions_mcp_deny_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            "deny = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn explicit_default_preserved_with_deprecated_deny_true() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(
-            dir.path(),
-            "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
-        );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(
-            perms.tool_defaults.get(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            Some(&DefaultEffect::Allow),
-            "explicit default still works; deprecated deny = true is ignored"
-        );
     }
 
     #[test]

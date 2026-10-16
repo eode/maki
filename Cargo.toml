@@ -1,20 +1,19 @@
 [package]
 name = "maki"
 version.workspace = true
-edition = "2024"
-authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
+edition.workspace = true
+authors.workspace = true
 description = "AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory."
-license = "MIT"
-repository = "https://github.com/tontinton/maki"
+license.workspace = true
+repository.workspace = true
 homepage = "https://maki.sh"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "coding"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.99"
+rust-version.workspace = true
 
-[[bin]]
-name = "maki"
-path = "src/main.rs"
+[lints]
+workspace = true
 
 [dependencies]
 maki-ui = { workspace = true }
@@ -35,11 +34,13 @@ smol = { workspace = true }
 tempfile = { workspace = true }
 isahc = { workspace = true }
 thiserror = { workspace = true }
-libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
@@ -50,28 +51,30 @@ members = [
   "maki-acp",
   "maki-agent",
   "maki-config",
+  "maki-config-macro",
   "maki-docgen",
   "maki-highlight",
   "maki-interpreter",
   "maki-lua",
+  "maki-lua-macro",
   "maki-markdown",
   "maki-otel",
   "maki-pack",
   "maki-providers",
   "maki-storage",
-  "maki-config-macro",
-  "maki-lua-macro",
   "maki-ui",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.3"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/tontinton/maki"
 rust-version = "1.99"
+
+[workspace.lints.clippy]
 
 [workspace.dependencies]
 maki-agent = { path = "maki-agent" }
@@ -129,8 +132,7 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
-rustix = { version = "1", default-features = false, features = ["process"] }
-humantime = "2"
+rustix = { version = "1", features = ["event", "fs", "process"] }
 semver = "1"
 toml = "1.1"
 toml_edit = "0.25"
@@ -190,10 +192,10 @@ tree-sitter-make = "1.1"
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty" }
 monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty-types" }
 notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }
+notify-rust = "4.18.1"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = "1.10"
-
 wait-timeout = "0.2"
 inventory = "0.3"
 

@@ -26,14 +26,16 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
 use crate::permissions::PermissionManager;
 use crate::tools::hook::Verdict;
-use crate::tools::{Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter};
+use crate::tools::{
+    Deadline, FileAccess, LocalTools, ToolAudience, ToolContext, ToolFilter, ToolOutputMode,
+};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InputSource, InterruptSource, RunLedger, SessionMailbox, SteerKind,
     TurnCompleteEvent,
 };
 use maki_config::{ModelPolicy, ToolOutputLines};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 /// One compaction is the whole remedy for an overflowing prompt, so a second
@@ -103,6 +105,11 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    /// The chat session a plugin runs this agent for in the background, `None`
+    /// for anything the user watches. Its file writes are denied while the
+    /// chat plans, see [`crate::AgentSeed::background_write_block`]. Subagents
+    /// inherit it, or a monitor could get around the block by starting one.
+    pub background_for: Option<MakiId>,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -160,6 +167,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    background_for: Option<MakiId>,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -206,6 +214,7 @@ impl<'h> Agent<'h> {
             overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            background_for: params.background_for,
             task_id: params.task_id,
             mailbox: params.mailbox,
             file_access: params.file_access,
@@ -391,7 +400,7 @@ impl<'h> Agent<'h> {
                 self.history.push(message);
             }
         }
-        self.tell_changes()?;
+        self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
         }
@@ -441,26 +450,19 @@ impl<'h> Agent<'h> {
     /// heard. Every fact is compared every time, so no path that changes one
     /// (a run start, an interrupt switching modes, a model switch, a
     /// compaction) has to remember to tell it.
-    fn tell_changes(&mut self) -> Result<(), AgentError> {
+    fn tell_changes(&mut self) {
         // Plan mode is in no rendered prompt, so only the agent knows it.
         let now = LiveFacts {
             plan: self.mode.plan_path().map(Path::to_path_buf),
             prompt: self.prompt_facts.clone(),
         };
-        let Some(update) = self
+        if let Some(update) = self
             .history
             .told()
             .and_then(|told| context_update(&told, &now))
-        else {
-            return Ok(());
-        };
-        if let Some(summary) = &update.display_text {
-            self.event_tx.send(AgentEvent::Notice {
-                text: summary.clone(),
-            })?;
+        {
+            self.history.push(update);
         }
-        self.history.push(update);
-        Ok(())
     }
 
     /// Picks up a model selected or refreshed while the run was working. The
@@ -518,7 +520,7 @@ impl<'h> Agent<'h> {
             .last()
             .is_some_and(|m| matches!(m.role, Role::Assistant));
         if !continues_answer {
-            self.tell_changes()?;
+            self.tell_changes();
         }
         Ok(())
     }
@@ -927,6 +929,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            background_for: self.background_for,
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -935,10 +938,11 @@ impl<'h> Agent<'h> {
             call_instructions: CallInstructions::default(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
-            deadline: Deadline::None,
+            deadline: Deadline::default(),
             config: self.config.clone(),
             tool_filter,
             tool_output_lines: self.tool_output_lines,
+            output_mode: ToolOutputMode::Compact,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
             file_access: Arc::clone(&self.file_access),
@@ -1378,6 +1382,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                background_for: None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),

@@ -15,11 +15,12 @@ use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
 use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
-    CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
-    ToolContext, truncate_bytes,
+    CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
+    truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -322,6 +323,7 @@ impl<'a> Hook<'a> {
             input,
             session_id: self.ctx.session_id.as_ref().map(SessionRef::as_str),
             origin: self.origin,
+            output_mode: self.ctx.output_mode,
             authority: self.authority,
             cancel: &self.ctx.cancel,
             deadline: self.window(),
@@ -338,10 +340,7 @@ impl<'a> Hook<'a> {
     /// answer would inherit a window the call already used up.
     fn window(&self) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
-        match self.ctx.deadline {
-            Deadline::At(at) => at.min(cap),
-            Deadline::None => cap,
-        }
+        self.ctx.deadline.at().map_or(cap, |at| at.min(cap))
     }
 }
 
@@ -399,6 +398,10 @@ struct Resolved<'a> {
 /// Precedence, highest first: client (ACP) tools, the registry, then MCP.
 /// The context is the only input, because resolving against one session and
 /// executing against another is how a tool escapes its audience.
+///
+/// A registry name the request's filter left out goes nowhere, and does not
+/// fall through to MCP either: a model told to call `bash` by a prompt that
+/// never published it must get nothing back.
 fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     // Names coming back from model JSON (batch children, `call_tool`, the
     // interpreter bridge) never passed through streaming.rs, so clean up here.
@@ -406,7 +409,11 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     let route = if let Some(local) = ctx.local_tools.get(name) {
         Route::Local(local)
     } else if let Some(entry) = ctx.registry.get(name) {
-        Route::Native(entry)
+        if ctx.tool_filter.matches(name) {
+            Route::Native(entry)
+        } else {
+            Route::Unknown
+        }
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Route::Mcp(mcp, qualified),
@@ -632,6 +639,18 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
+        if let Some(chat) = ctx.background_for
+            && let Some(reason) = AgentSeed::background_write_block(chat)
+        {
+            warn!(
+                tool = %name,
+                %chat,
+                target = %key.as_path().display(),
+                reason = %reason,
+                "blocked background write"
+            );
+            return done_error(reason);
+        }
         let is_plan_target = ctx
             .mode
             .plan_path()
@@ -846,6 +865,9 @@ async fn enforce_permission(
     }
 }
 
+/// Every permission check passes through here, so this is where the clock
+/// stops while the user decides. Someone who answers a minute later should
+/// not find the call already timed out before it even started.
 async fn gate(
     ctx: &ToolContext,
     tool: &ToolKey,
@@ -853,17 +875,19 @@ async fn gate(
     id: &str,
     ask: Option<&str>,
 ) -> Result<(), String> {
-    ctx.permissions
-        .enforce(
-            tool,
-            scopes,
-            &ctx.event_tx,
-            ctx.user_response_rx.as_deref(),
-            id,
-            &ctx.cancel,
-            ctx.mode.plan_path(),
-            ask,
-        )
+    let decision = ctx.permissions.enforce(
+        tool,
+        scopes,
+        ctx.session_id.as_ref(),
+        &ctx.event_tx,
+        ctx.user_response_rx.as_deref(),
+        id,
+        &ctx.cancel,
+        ctx.mode.plan_path(),
+        ask,
+    );
+    ctx.deadline
+        .paused_while(decision)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1090,11 +1114,13 @@ mod tests {
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
     use crate::cancel::CancelToken;
+    use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
     use crate::permissions::{
@@ -1105,12 +1131,12 @@ mod tests {
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
-        stub_ctx_with_permissions,
+        stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
-        BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-        PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience, ToolExecResult,
-        ToolHook, local_tool,
+        BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+        ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
+        ToolExecResult, ToolFilter, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1156,6 +1182,7 @@ mod tests {
     const SCOPELESS_TOOL_NAME: &str = "scopeless";
     const SEARCH_QUERY_FIELD: &str = "query";
     const SEARCH_QUERY: &str = "probe";
+    const PROMPT_THINK_TIME: Duration = Duration::from_millis(20);
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
         let mut rc = RecentCalls::new();
@@ -1666,9 +1693,9 @@ mod tests {
     #[test]
     fn a_firing_carries_the_calls_cancellation_and_deadline() {
         smol::block_on(async {
-            let at = Instant::now() + HOOK_CALL_DEADLINE;
             let mut ctx = build_ctx();
-            ctx.deadline = Deadline::At(at);
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+            let at = ctx.deadline.at();
             ctx.cancel = cancelled_token();
             let (ctx, hook) = hooked_ctx(ctx);
 
@@ -1676,7 +1703,11 @@ mod tests {
 
             let firing = hook.at(HookStage::Input).expect("the input stage fired");
             assert!(firing.cancelled, "the call's own token, not a fresh one");
-            assert_eq!(firing.deadline, at, "and no later than the call itself");
+            assert_eq!(
+                Some(firing.deadline),
+                at,
+                "and no later than the call itself"
+            );
         });
     }
 
@@ -1804,6 +1835,45 @@ mod tests {
             let plan = AgentMode::Plan(PathBuf::from(PLAN_PATH));
             let (ctx, _hook) = hooked_with(stub_ctx(&plan), None, hook);
             let done = dispatch(&ctx, HOOK_TOOL_NAME, &call_input(PLAN_PATH)).await;
+
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
+    fn planning() -> AgentMode {
+        AgentMode::Plan(PathBuf::from(PLAN_PATH))
+    }
+
+    /// Background work runs in build mode, so this gate is the only place the
+    /// chat's plan mode reaches it. Even the plan file gets no pass, because
+    /// nobody asked a monitor to write the user's plan. A write from inside
+    /// batch or code_execution must not slip past it either.
+    #[test_case(planning(),       PLAN_PATH,         CallOrigin::Model,  BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "plan_file_while_the_chat_plans")]
+    #[test_case(planning(),       HOOK_ESCAPED_PATH, CallOrigin::Nested, BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "nested_write_while_the_chat_plans")]
+    #[test_case(AgentMode::Build, PLAN_PATH,         CallOrigin::Model,  ran(PLAN_PATH)                          ; "building_chat_follows_the_rules")]
+    fn background_write_follows_the_chat_mode(
+        chat_mode: AgentMode,
+        target: &str,
+        origin: CallOrigin,
+        expected: String,
+    ) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let seed = mailbox.publish_seed(stub_seed(chat));
+            seed.set_chat_settings(Default::default(), &chat_mode);
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.background_for = Some(chat);
+
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(target),
+                &ctx,
+                origin,
+            )
+            .await;
 
             assert_eq!(done.output.as_text(), expected);
         });
@@ -2399,6 +2469,23 @@ mod tests {
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
     }
 
+    /// The filter gates dispatch, not only the list the sandbox sees, or a
+    /// plugin pricing a session by the array it hands over would pay for less
+    /// than the session reaches.
+    #[test]
+    fn dispatch_refuses_a_registry_name_the_filter_left_out() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            ctx.tool_filter = Arc::new(ToolFilter::Only(vec![OTHER_WIRE.to_owned()]));
+
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
+        });
+    }
+
     /// A host that trims the array it publishes (a Lua caller passing `except`)
     /// has answered for the sandbox too, because the filter comes off that same
     /// array.
@@ -2587,6 +2674,48 @@ mod tests {
                 done.output.as_text().starts_with(PERMISSION_DENIED_PREFIX),
                 "error should be the permission-denied message, got: {}",
                 done.output.as_text()
+            );
+        });
+    }
+
+    /// We measure the pause on the output hook's window instead of racing the
+    /// tool against a tiny budget, so a slow machine can't fail this. The tool
+    /// shares that same deadline, so it gets the time back too.
+    #[test]
+    fn time_on_a_permission_prompt_does_not_spend_the_deadline() {
+        smol::block_on(async {
+            let mut ctx = rules_ctx(&AgentMode::Build, Vec::new());
+            ctx.registry = registered(Arc::new(GuardedMock));
+            let hook = RecordingHook::default();
+            ctx.registry.set_hook(hook.clone());
+            let (event_tx, events) = flume::unbounded();
+            let (answer_tx, answer_rx) = flume::unbounded();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(answer_rx)));
+            ctx.deadline = Deadline::after(HOOK_CALL_DEADLINE);
+
+            let user = async {
+                while !matches!(
+                    events.recv_async().await.unwrap().event,
+                    AgentEvent::PermissionRequest { .. }
+                ) {}
+                smol::Timer::after(PROMPT_THINK_TIME).await;
+                answer_tx
+                    .send(TaggedAnswer::new(TEST_ID, PermissionAnswer::AllowOnce).encode())
+                    .unwrap();
+            };
+            let (done, ()) = futures_lite::future::zip(
+                dispatch(&ctx, GUARDED_TOOL_NAME, &serde_json::json!({})),
+                user,
+            )
+            .await;
+
+            assert!(!done.is_error, "got: {}", done.output.as_text());
+            let input = hook.at(HookStage::Input).expect("the input stage fired");
+            let output = hook.at(HookStage::Output).expect("the output stage fired");
+            assert!(
+                output.deadline - input.deadline >= PROMPT_THINK_TIME,
+                "the prompt ate into the call's budget"
             );
         });
     }

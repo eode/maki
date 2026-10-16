@@ -772,6 +772,9 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
+            for rt in &self.sessions {
+                rt.handles.publish_chat_settings(&rt.app);
+            }
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -1031,6 +1034,15 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
+            UiAction::BackgroundUsage {
+                session,
+                model,
+                usage,
+            } => {
+                for rt in &mut self.sessions {
+                    rt.app.add_background_usage(session, &model, usage);
+                }
+            }
         }
     }
 
@@ -1125,7 +1137,7 @@ impl<'t> EventLoop<'t> {
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
-            && let Err(error) = notifier.notify(&notification.message())
+            && let Err(error) = notifier.notify(&notification.message(), notification.reason())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
             self.notifier = None;
@@ -1393,6 +1405,7 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
         }
     }
 

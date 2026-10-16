@@ -111,6 +111,9 @@ local function run_rtk(cmd)
 end
 
 local function rtk_rewrite(command, ctx)
+  if ctx:output_mode() == "full" then
+    return nil
+  end
   local config = ctx:config()
   if config and not config.rtk then
     return nil
@@ -253,18 +256,18 @@ end
 local description = [[Execute a bash command.
 Commands run in the session's working directory (see Environment) by default.
 
-- **DO NOT** use for file ops! Only git, builds, tests, and system commands.
+- Read, list, search, and edit files with dedicated tools, not cat/ls/find/grep/sed. Bash is for git, builds, tests, and file management (mv, cp, rm, mkdir).
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
-- Output truncated beyond 2000 lines or 50KB.
+- Output sent to the model is truncated beyond 2000 lines or 50KB.
 - Interactive commands (sudo, ssh prompts) fail immediately.
 - Use the `tail` param, not `| tail`: piping hides live output.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+  content = "- Read, list, search, and edit files with dedicated tools, even outside cwd. Bash is for git, builds, tests, and file management (mv, cp, rm, mkdir).",
 })
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -386,9 +389,8 @@ maki.api.register_tool({
     local has_output = false
     local finished = false
 
-    -- The cut happens on the accumulated text, after the view already streamed
-    -- every line, so the user still sees the whole run while the model gets
-    -- only the tail. Both the exit and the cancel path go through here.
+    -- Presentation limits apply after the view streams every line. Both the
+    -- exit and cancel path go through here.
     local function final_output()
       local output = table.concat(output_parts)
       if input.tail then
