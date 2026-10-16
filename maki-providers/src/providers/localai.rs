@@ -1,26 +1,18 @@
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use maki_config::providers::Protocol;
 
+use crate::AgentError;
 use crate::model::ModelFamily;
 use crate::provider::Provider;
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS,
     Native, ProviderSpec,
 };
 
+use super::local::{LOCALAI, LocalEndpoint};
 use super::{ResolvedAuth, Timeouts};
-use crate::AgentError;
-use crate::types::ThinkingFallback;
-
-use super::aperture::DEFAULT_PATH_PREFIX;
-use super::local::{DiscoveryMode, LocalEndpoint, LocalEndpointConfig};
-use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig};
-
-const LOCALAI_SLUG: &str = "localai";
-const LOCALAI_BASE_URL: &str = "http://localhost:8080/v1";
-const LOCALAI_KEY_ENV: &str = "LOCALAI_API_KEY";
 
 /// `KeyPool::resolve` failing is not fatal, so the key stays
 /// optional: most instances need none, but a proxy may demand one.
@@ -36,30 +28,10 @@ const DISCOVERY_NOTE: &str = "LocalAI exposes its full model table over the Open
     `/api/tags` + `/api/show`. This provider also works with llama.cpp's server, \
     which speaks the same protocol.";
 
-pub(crate) const LOCALAI: LocalEndpointConfig = LocalEndpointConfig {
-    slug: LOCALAI_SLUG,
-    display_name: "LocalAI",
-    host_env: "LOCALAI_HOST",
-    api_key_env: LOCALAI_KEY_ENV,
-    default_host: "http://localhost:8080",
-    default_model: "localai/default",
-    cloud_fallback_url: None,
-    discovery_mode: DiscoveryMode::LocalAI,
-    compat: OpenAiCompatConfig {
-        slug: Cow::Borrowed(LOCALAI_SLUG),
-        api_key_env: Cow::Borrowed(""),
-        base_url: Cow::Borrowed(LOCALAI_BASE_URL),
-        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
-        include_stream_usage: true,
-        provider_name: Cow::Borrowed("LocalAI"),
-    },
-    thinking_fallback: ThinkingFallback::BudgetField,
-};
-
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {
-    slug: LOCALAI_SLUG,
-    display_name: "LocalAI",
-    api_key_env: LOCALAI_KEY_ENV,
+    slug: LOCALAI.slug,
+    display_name: LOCALAI.display_name,
+    api_key_env: LOCALAI.api_key_env,
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
@@ -77,14 +49,16 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     }),
     login: Some(LoginConfig {
         protocol: Protocol::Openai,
-        default_base_url: "http://localhost:8080",
-        default_model: "localai/default",
+        default_base_url: LOCALAI.default_host,
+        default_model: LOCALAI.default_model,
         plans: None,
         login_url: None,
         needs_url: true,
     }),
     docs: GeneratedDocs {
-        api_urls: &[LOCALAI_BASE_URL],
+        // Docs quote the codec url, which carries the `/v1` segment the login
+        // default leaves off.
+        api_urls: &[super::local::LOCALAI_BASE_URL],
         auth: AuthDoc::Custom(AUTH_DOC),
         features: Some(FEATURES),
         catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
@@ -100,7 +74,7 @@ fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
 
 fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
-    timeouts: super::Timeouts,
+    timeouts: Timeouts,
     system_prefix: Option<String>,
 ) -> Box<dyn Provider> {
     Box::new(LocalEndpoint::with_auth(&LOCALAI, auth, timeouts).with_system_prefix(system_prefix))

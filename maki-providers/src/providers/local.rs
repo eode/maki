@@ -738,8 +738,10 @@ impl LocalEndpoint {
 
 const OLLAMA_SLUG: &str = "ollama";
 const LLAMACPP_SLUG: &str = "llama-cpp";
+const LOCALAI_SLUG: &str = "localai";
 pub(crate) const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 pub(crate) const LLAMACPP_BASE_URL: &str = "http://localhost:8080/v1";
+pub(crate) const LOCALAI_BASE_URL: &str = "http://localhost:8080/v1";
 
 pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     slug: OLLAMA_SLUG,
@@ -782,6 +784,26 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     thinking_fallback: ThinkingFallback::BudgetField,
 };
 
+pub(crate) const LOCALAI: LocalEndpointConfig = LocalEndpointConfig {
+    slug: LOCALAI_SLUG,
+    display_name: "LocalAI",
+    host_env: "LOCALAI_HOST",
+    api_key_env: "LOCALAI_API_KEY",
+    default_host: "http://localhost:8080",
+    default_model: "localai/default",
+    cloud_fallback_url: None,
+    discovery_mode: DiscoveryMode::LocalAI,
+    compat: OpenAiCompatConfig {
+        slug: Cow::Borrowed(LOCALAI_SLUG),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed(LOCALAI_BASE_URL),
+        max_tokens_field: Cow::Borrowed(DEFAULT_MAX_TOKENS_FIELD),
+        include_stream_usage: true,
+        provider_name: Cow::Borrowed("LocalAI"),
+    },
+    thinking_fallback: ThinkingFallback::BudgetField,
+};
+
 #[cfg(test)]
 mod tests {
     use super::super::{Timeouts, localai};
@@ -792,7 +814,7 @@ mod tests {
     /// start reporting them as dropped.
     #[test]
     fn local_slugs_read_their_declared_thinking_keys() {
-        for cfg in [OLLAMA, LLAMACPP, localai::LOCALAI] {
+        for cfg in [OLLAMA, LLAMACPP, LOCALAI] {
             assert!(maki_config::providers::overlays_local_thinking(cfg.slug));
         }
     }
@@ -801,7 +823,7 @@ mod tests {
     /// which is always `Err`, so the key could never be set.
     #[test]
     fn every_local_slug_names_a_real_key_env() {
-        for cfg in [OLLAMA, LLAMACPP, localai::LOCALAI] {
+        for cfg in [OLLAMA, LLAMACPP, LOCALAI] {
             assert!(!cfg.api_key_env.is_empty(), "{} has no key env", cfg.slug);
         }
     }
@@ -810,7 +832,7 @@ mod tests {
     /// match the one the request path resolves against.
     #[test]
     fn localai_spec_and_endpoint_agree_on_the_key_env() {
-        assert_eq!(localai::SPEC.api_key_env, localai::LOCALAI.api_key_env);
+        assert_eq!(localai::SPEC.api_key_env, LOCALAI.api_key_env);
     }
 
     #[test]
