@@ -590,7 +590,7 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let local = overlays_local_thinking(slug);
     let mut ignored = Vec::new();
-    if def.protocol.is_some() && !local {
+    if def.protocol.is_some_and(|p| !local || !matches!(p, Protocol::Openai | Protocol::OpenaiResponses)) {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
