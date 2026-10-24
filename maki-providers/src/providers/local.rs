@@ -640,6 +640,12 @@ impl LocalEndpoint {
             self.localai_legacy_models(auth, root).await?
         } else {
             caps.into_iter()
+                .filter(|entry| {
+                    entry.capabilities.as_deref().is_none_or(|caps| {
+                        caps.iter()
+                            .any(|capability| matches!(capability.as_str(), "chat" | "completion"))
+                    })
+                })
                 .map(localai_capability_model_info)
                 .collect()
         };
