@@ -536,7 +536,7 @@ fn ollama_extract_num_ctx(params: &str) -> Option<u32> {
 
 /// LocalAI omits `context_size` for models loaded without an
 /// explicit limit, so discovery assumes this instead of none.
-const LOCALAI_ASSUMED_CONTEXT_WINDOW: u32 = 128_000;
+const LOCALAI_ASSUMED_CONTEXT_WINDOW: u32 = 4096;
 
 #[derive(Deserialize)]
 struct LocalAiCapabilitiesResponse {
