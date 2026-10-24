@@ -801,7 +801,7 @@ pub(crate) const LOCALAI: LocalEndpointConfig = LocalEndpointConfig {
         include_stream_usage: true,
         provider_name: Cow::Borrowed("LocalAI"),
     },
-    thinking_fallback: ThinkingFallback::BudgetField,
+    thinking_fallback: ThinkingFallback::Dialect(&crate::dialect::OLLAMA),
 };
 
 #[cfg(test)]
