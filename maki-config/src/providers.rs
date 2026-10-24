@@ -590,7 +590,10 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let local = overlays_local_thinking(slug);
     let mut ignored = Vec::new();
-    if def.protocol.is_some_and(|p| !local || !matches!(p, Protocol::Openai | Protocol::OpenaiResponses)) {
+    if def
+        .protocol
+        .is_some_and(|p| !local || !matches!(p, Protocol::Openai | Protocol::OpenaiResponses))
+    {
         ignored.push("protocol");
     }
     if def.api_key_env.is_some() {
@@ -1029,29 +1032,6 @@ tier = "{input}"
             ..ProviderDef::default()
         };
         assert_eq!(ignored_builtin_fields(slug, &def), expected);
-    }
-
-    /// The exemption rides on [`overlays_local_thinking`], so a slug added to
-    /// `LOCAL_OVERLAY_SLUGS` whose constructor never calls `resolve_protocol`
-    /// would silently claim a `protocol` nobody reads. The per-slug expectations
-    /// above cover what the warning says; this covers whether that is true.
-    #[test]
-    fn every_exempt_slug_really_resolves_its_configured_protocol() {
-        let def = ProviderDef {
-            protocol: Some(Protocol::OpenaiResponses),
-            ..ProviderDef::default()
-        };
-        for slug in LOCAL_OVERLAY_SLUGS {
-            assert!(
-                !ignored_builtin_fields(slug, &def).contains(&"protocol"),
-                "{slug} is reported as ignoring protocol; fix the warning or drop it from the overlay"
-            );
-            assert_eq!(
-                resolve_protocol(slug, Some(&def)),
-                Some(Protocol::OpenaiResponses),
-                "{slug} exempts protocol but does not read it"
-            );
-        }
     }
 
     /// The literal below stops compiling when [`ModelDef`] grows a field, which

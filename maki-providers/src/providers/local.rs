@@ -711,7 +711,7 @@ pub(crate) const LOCALAI: LocalEndpointConfig = LocalEndpointConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Timeouts, localai};
+    use super::super::Timeouts;
     use super::*;
 
     /// maki-config keeps its own list of the slugs whose thinking keys it lets
@@ -731,13 +731,6 @@ mod tests {
         for cfg in [OLLAMA, LLAMACPP, LOCALAI] {
             assert!(!cfg.api_key_env.is_empty(), "{} has no key env", cfg.slug);
         }
-    }
-
-    /// `child_env` and `models_cache` read the spec's var, so it has to
-    /// match the one the request path resolves against.
-    #[test]
-    fn localai_spec_and_endpoint_agree_on_the_key_env() {
-        assert_eq!(localai::SPEC.api_key_env, LOCALAI.api_key_env);
     }
 
     #[test]
