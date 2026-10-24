@@ -24,8 +24,8 @@ const FEATURES: &str =
 
 const DISCOVERY_NOTE: &str = "LocalAI exposes its full model table over the OpenAI-compatible `/v1` API; its \
     `/v1/models/capabilities` endpoint additionally publishes `context_size` plus \
-    capabilities/modalities. Older instances fall back to the Ollama-compat \
-    `/api/tags` + `/api/show`. This provider also works with llama.cpp's server, \
+    capabilities/modalities. Older instances fall back to the Ollama-compatible \
+    `/v1/models` + `/api/show` endpoints. This provider also works with llama.cpp's server, \
     which speaks the same protocol.";
 
 pub(crate) const SPEC: ProviderSpec = ProviderSpec {

@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
@@ -558,25 +557,12 @@ struct LocalAiCapabilityEntry {
 }
 
 /// An absent or unparsable body means an older instance, so this
-/// yields no entries and discovery falls back to the Ollama-compat
-/// surface instead of reporting no models.
+/// yields no entries and discovery falls back to Ollama-compatible
+/// `/v1/models` + `/api/show` discovery instead of reporting no models.
 fn localai_capability_entries(body: &str) -> Vec<LocalAiCapabilityEntry> {
     serde_json::from_str::<LocalAiCapabilitiesResponse>(body)
         .map(|r| r.data)
         .unwrap_or_default()
-}
-
-// Ollama-compat /api/tags listing, the fallback for older LocalAI.
-#[derive(Deserialize)]
-struct OllamaApiTagsResponse {
-    #[serde(default)]
-    models: Vec<OllamaApiTagsEntry>,
-}
-
-#[derive(Deserialize)]
-struct OllamaApiTagsEntry {
-    #[serde(default)]
-    model: String,
 }
 
 /// `None` when the entry reported neither `capabilities` nor
@@ -637,7 +623,7 @@ impl LocalEndpoint {
             .unwrap_or_default();
 
         let mut models = if caps.is_empty() {
-            self.localai_legacy_models(auth, root).await?
+            self.discover_ollama_models(auth).await?
         } else {
             caps.into_iter()
                 .filter(|entry| {
@@ -651,93 +637,6 @@ impl LocalEndpoint {
         };
 
         models.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(models)
-    }
-
-    /// An instance without the capability surface. The OpenAI listing
-    /// carries only ids, so the Ollama-compat surface fills in the
-    /// limits. That enrichment is optional, so a failure there leaves
-    /// the ids-only listing intact rather than losing the model.
-    async fn localai_legacy_models(
-        &self,
-        auth: &ResolvedAuth,
-        root: &str,
-    ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        let models_text = self
-            .compat
-            .get_text(auth, &format!("{root}/v1/models"))
-            .await?;
-        let body: LlamaCppModelsResponse = serde_json::from_str(&models_text)?;
-        let mut models: Vec<crate::model::ModelInfo> = body
-            .data
-            .into_iter()
-            .map(|m| crate::model::ModelInfo {
-                id: m.id,
-                context_window: None,
-                max_output_tokens: None,
-                pricing: Some(crate::model::ModelPricing::ZERO),
-                supports_thinking: None,
-                supports_vision: None,
-                tier: None,
-                provider_info: None,
-                extra: None,
-                effort: None,
-            })
-            .collect();
-
-        // /api/tags lists the models; /api/show carries the context
-        // length the listing leaves out.
-        let Ok(tags_text) = self
-            .compat
-            .get_text(auth, &format!("{root}/api/tags"))
-            .await
-        else {
-            return Ok(models);
-        };
-        let tags: OllamaApiTagsResponse = match serde_json::from_str(&tags_text) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Failed to parse LocalAI Ollama-compat /api/tags: {e}");
-                return Ok(models);
-            }
-        };
-        if tags.models.is_empty() {
-            return Ok(models);
-        }
-
-        let compat = &self.compat;
-        let details: Vec<OllamaModelDetails> = join_all(
-            tags.models
-                .iter()
-                .map(|m| ollama_fetch_model_details(compat, auth, root, &m.model)),
-        )
-        .await;
-        let by_id: HashMap<_, _> = tags
-            .models
-            .into_iter()
-            .zip(details)
-            .map(|(m, d)| (m.model, d))
-            .collect();
-
-        let mut enriched = 0;
-        for model in &mut models {
-            if let Some(details) = by_id.get(&model.id) {
-                enriched += 1;
-                model.context_window = details.context_window;
-                model.supports_vision = details.supports_vision;
-            }
-        }
-        // The two surfaces name models independently, and a proxy in between
-        // may rewrite one of them, so a total miss is worth a line rather
-        // than a silent "no limits known".
-        if enriched == 0 {
-            warn!(
-                listed = models.len(),
-                tagged = by_id.len(),
-                "LocalAI /api/tags named no model /v1/models listed; limits stay unknown"
-            );
-        }
-
         Ok(models)
     }
 }
@@ -1448,7 +1347,7 @@ mod tests {
 
         /// An older instance 404s or answers a body without `data`;
         /// discovery treats that as "no capability surface" and falls
-        /// back to the Ollama-compat listing.
+        /// back to the Ollama-compatible `/v1/models` + `/api/show` discovery.
         #[test_case("{}" ; "empty_object")]
         #[test_case("not json" ; "unparsable")]
         fn an_absent_or_unparsable_body_yields_no_entries(body: &str) {
