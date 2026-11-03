@@ -143,6 +143,15 @@ const SLOW_DOWN_HEADERS: &[(&str, &str)] = &[
 const CHAT_SCRIPT: &[Canned] = &[Canned::sse(CHAT_TRANSCRIPT)];
 const RESPONSES_SCRIPT: &[Canned] = &[Canned::sse(RESPONSES_TRANSCRIPT)];
 const NO_REQUESTS: &[Canned] = &[];
+
+const LOCALAI_SLUG: &str = "localai";
+const LOCALAI_DISPLAY_NAME: &str = "LocalAI";
+const LOCALAI_MODEL: &str = "localai-model";
+const LOCALAI_BASE_URL_ENV: &str = "LOCALAI_BASE_URL";
+
+const LOCALAI_CAPABILITIES_BODY: &str = r#"{"data":[{"id":"localai-model","capabilities":["chat","thinking","vision"],"input_modalities":["text","image"],"context_size":32000}]}"#;
+const LOCALAI_CAPABILITIES_SCRIPT: &[Canned] = &[Canned::json(200, LOCALAI_CAPABILITIES_BODY)];
+
 const MODELS_BODY: &str = r#"{"data":[{"id":"acme-1","context_length":128000}]}"#;
 const MODELS_SCRIPT: &[Canned] = &[Canned::json(200, MODELS_BODY)];
 const REFRESH_SCRIPT: &[Canned] = &[
@@ -186,6 +195,15 @@ fn isolated_state() -> TempDir {
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin/init.lua")
+}
+
+/// Path to the localai plugin bundled in `plugins/localai/init.lua` at the
+/// workspace root (one level above the maki-lua crate).
+fn localai_plugin_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("maki-lua crate dir has a parent")
+        .join("plugins/localai/init.lua")
 }
 
 /// A grant to reach exactly one host, the way a `plugin.toml` with a
@@ -825,4 +843,101 @@ fn a_third_party_plugin_cannot_take_a_builtin_slug() {
 
     assert!(error.to_string().contains(RESERVED_SLUG_MESSAGE), "{error}");
     assert!(!plugin::is_registered(BUILTIN_SLUG), "{BUILTIN_TAKEN}");
+}
+
+/// The localai plugin, loaded from disk, talking to a recorded capabilities
+/// endpoint. Only `chat`/`completion` models survive; embedding models are
+/// filtered out.
+#[test]
+fn localai_plugin_lists_models_from_capabilities() {
+    let _state = isolated_state();
+    // Save an empty config so `localai` isn't picked up from a pre-existing
+    // providers.toml on disk (e.g. one left over from the user's setup).
+    ProvidersConfig::default().save().unwrap();
+    let (base_url, server) = serve(LOCALAI_CAPABILITIES_SCRIPT);
+    unsafe {
+        std::env::set_var(LOCALAI_BASE_URL_ENV, &base_url);
+        std::env::set_var("LOCALAI_API_KEY", "test-key");
+    }
+
+    let host = plugin_host();
+    host.load_plugin_file(&localai_plugin_path()).expect(LOAD_FAILED);
+    plugin::commit_load();
+
+    let provider = plugin::create(LOCALAI_SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let models = smol::block_on(provider.list_models()).expect(HOOK_FAILED);
+
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, LOCALAI_MODEL);
+    assert_eq!(models[0].context_window, Some(32000));
+    assert_eq!(models[0].supports_thinking, Some(true));
+    assert_eq!(models[0].supports_vision, Some(true));
+    assert_eq!(models[0].tier, None);
+
+    let asked = server.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].path.ends_with("/v1/models/capabilities"), "{}", asked[0].path);
+}
+
+/// `build_body` adds `return_progress` when the resolved protocol is
+/// `openai-responses`, and not otherwise.
+#[test_case(true  ; "openai-responses")]
+#[test_case(false ; "openai")]
+fn localai_build_body_return_progress_for_responses(use_responses: bool) {
+    let _state = isolated_state();
+    let (base_url, server) = serve(CHAT_SCRIPT);
+
+    // Save an empty config so the plugin can register without conflicting
+    // with a pre-existing `localai` entry on disk.
+    ProvidersConfig::default().save().unwrap();
+
+    unsafe { std::env::set_var("LOCALAI_API_KEY", "test-key") };
+
+    let host = plugin_host();
+    let source = format!(
+        r#"
+maki.provider.register({{
+  slug = "{LOCALAI_SLUG}", display_name = "{LOCALAI_DISPLAY_NAME}", codec = "openai",
+  base_url = "{base_url}",
+  models = {{ {{ prefixes = {{ "{LOCALAI_MODEL}" }} }} }},
+  build_body = function(_, body, _model, opts)
+    if opts.protocol == "openai-responses" then
+      body.return_progress = true
+    end
+    return body
+  end,
+}})
+"#
+    );
+    load_inline(&host, &source, LOOPBACK_HOST);
+    plugin::commit_load();
+
+    // Add the configured protocol after registration, so create() resolves it
+    // at build time and overrides the declared codec.
+    if use_responses {
+        let mut config = ProvidersConfig::load_or_default();
+        config.providers.insert(
+            LOCALAI_SLUG.into(),
+            ProviderDef {
+                protocol: Some(Protocol::OpenaiResponses),
+                ..ProviderDef::default()
+            },
+        );
+        config.save().unwrap();
+    }
+
+    let provider = plugin::create(LOCALAI_SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let model = Model::from_spec(&format!("{LOCALAI_SLUG}/{LOCALAI_MODEL}")).expect(UNKNOWN_MODEL);
+
+    let (_, result) = stream(provider.as_ref(), &model, ThinkingConfig::Off);
+    result.expect(STREAM_FAILED);
+
+    let sent = server.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let return_progress = &sent[0].json()["return_progress"];
+    if use_responses {
+        assert_eq!(return_progress, &json!(true));
+    } else {
+        assert_eq!(return_progress, &Value::Null);
+    }
 }
